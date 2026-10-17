@@ -1,1 +1,263 @@
+# TELEGRAM KINO BOT: bitta fayl, to'liq bepul
+#
+# QANDAY QO'YILADI:
+# 1) GitHub'da yangi private repo oching.
+# 2) Add file -> Create new file. Fayl nomi sifatida aynan shuni yozing:
+#       .github/workflows/kino.yml
+#    (slash yozsangiz papkalar o'zi yaratiladi), shu faylning hamma matnini ichiga joylang.
+# 3) Settings -> Secrets and variables -> Actions -> New repository secret:
+#       TMDB_API_KEY, BOT_TOKEN, TELEGRAM_CHAT_ID
+# 4) Actions -> "Kunlik kinolar" -> Run workflow bosib sinab ko'ring.
+#    Keyin har kuni Toshkent vaqti bilan 09:00 da o'zi ishlaydi.
 
+name: Kunlik kinolar
+
+on:
+  schedule:
+    - cron: "0 4 * * *"   # 04:00 UTC = Toshkent 09:00
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install requests
+
+      - name: Kinolarni yuborish
+        env:
+          TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python - <<'PY'
+          #!/usr/bin/env python3
+          """Har kuni TMDB'dan 3 ta kinoni topib, Telegram'ga yuboradi.
+
+          Kerakli muhit o'zgaruvchilari:
+            TMDB_API_KEY      - themoviedb.org dan olingan API kalit
+            BOT_TOKEN         - BotFather bergan token
+            TELEGRAM_CHAT_ID  - post yuboriladigan chat (shaxsiy chat ID yoki @kanal / -100... ID)
+          Ixtiyoriy:
+            MOVIES_PER_DAY    - kuniga nechta kino (standart: 3)
+            REGION            - mamlakat kodi (standart: US)
+          """
+          import html
+          import json
+          import os
+          import sys
+          from datetime import date
+          from pathlib import Path
+
+          import requests
+
+          TMDB = "https://api.themoviedb.org/3"
+          IMG = "https://image.tmdb.org/t/p/w780"
+          SENT_FILE = Path("sent.json")
+
+          TMDB_KEY = os.environ["TMDB_API_KEY"]
+          BOT_TOKEN = os.environ["BOT_TOKEN"]
+          CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+          PER_DAY = int(os.environ.get("MOVIES_PER_DAY", "3"))
+          REGION = os.environ.get("REGION", "US")
+
+          MONTHS = [
+              "yanvar", "fevral", "mart", "aprel", "may", "iyun",
+              "iyul", "avgust", "sentabr", "oktabr", "noyabr", "dekabr",
+          ]
+
+
+          GENRES_UZ = {
+              28: "Jangari", 12: "Sarguzasht", 16: "Multfilm", 35: "Komediya",
+              80: "Kriminal", 99: "Hujjatli", 18: "Drama", 10751: "Oilaviy",
+              14: "Fentezi", 36: "Tarixiy", 27: "Qo'rqinchli", 10402: "Musiqiy",
+              9648: "Detektiv", 10749: "Melodrama", 878: "Ilmiy fantastika",
+              10770: "Telefilm", 53: "Triller", 10752: "Harbiy", 37: "Vestern",
+          }
+
+
+          def to_uzbek(text):
+              """Matnni o'zbekchaga tarjima qiladi. Ishlamasa, asl matnni qaytaradi."""
+              if not text:
+                  return text
+              # 1) Google (kalitsiz, norasmiy)
+              try:
+                  r = requests.get(
+                      "https://translate.googleapis.com/translate_a/single",
+                      params={"client": "gtx", "sl": "auto", "tl": "uz", "dt": "t", "q": text},
+                      timeout=20,
+                  )
+                  r.raise_for_status()
+                  out = "".join(p[0] for p in r.json()[0] if p and p[0])
+                  if out.strip():
+                      return out
+              except Exception as e:
+                  print("Tarjima (1) xatosi:", e, file=sys.stderr)
+              # 2) MyMemory (zaxira)
+              try:
+                  r = requests.get(
+                      "https://api.mymemory.translated.net/get",
+                      params={"q": text[:480], "langpair": "en|uz"},
+                      timeout=20,
+                  )
+                  r.raise_for_status()
+                  out = r.json().get("responseData", {}).get("translatedText", "")
+                  if out.strip():
+                      return out
+              except Exception as e:
+                  print("Tarjima (2) xatosi:", e, file=sys.stderr)
+              return text
+
+
+          def tmdb(path, **params):
+              params["api_key"] = TMDB_KEY
+              r = requests.get(f"{TMDB}{path}", params=params, timeout=30)
+              r.raise_for_status()
+              return r.json()
+
+
+          def load_sent():
+              if SENT_FILE.exists():
+                  return set(json.loads(SENT_FILE.read_text()))
+              return set()
+
+
+          def save_sent(ids):
+              SENT_FILE.write_text(json.dumps(sorted(ids)))
+
+
+          def pick_movies(sent):
+              today = date.today().isoformat()
+              now_n = min(int(os.environ.get("NOW_PLAYING_COUNT", "1")), PER_DAY)
+              soon_n = PER_DAY - now_n
+
+              # Tez orada chiqadigan kinolar (mashhurlik bo'yicha)
+              soon = tmdb(
+                  "/discover/movie",
+                  sort_by="popularity.desc",
+                  **{"primary_release_date.gte": today},
+                  region=REGION,
+                  language="en-US",
+                  include_adult="false",
+                  page=1,
+              ).get("results", [])
+              for m in soon:
+                  m["_tag"] = "soon"
+              # Hozir kinoteatrda
+              playing = tmdb("/movie/now_playing", region=REGION, language="en-US", page=1).get("results", [])
+              for m in playing:
+                  m["_tag"] = "now"
+
+              picked = []
+
+              def take(pool, n):
+                  for m in pool:
+                      if n <= 0:
+                          break
+                      if m["id"] in sent or any(p["id"] == m["id"] for p in picked):
+                          continue
+                      if not m.get("poster_path"):
+                          continue
+                      picked.append(m)
+                      n -= 1
+
+              take(soon, soon_n)
+              take(playing, now_n)
+              # biror toifada yetmasa, ikkinchisidan to'ldiramiz
+              take(soon + playing, PER_DAY - len(picked))
+              return picked
+
+
+          def trailer_url(movie_id):
+              for lang in ("en-US", "ru-RU"):
+                  vids = tmdb(f"/movie/{movie_id}/videos", language=lang).get("results", [])
+                  for v in vids:
+                      if v["site"] == "YouTube" and v["type"] == "Trailer":
+                          return f"https://www.youtube.com/watch?v={v['key']}"
+              return None
+
+
+          def fmt_date(iso):
+              if not iso:
+                  return "noma'lum"
+              y, m, d = iso.split("-")
+              return f"{int(d)}-{MONTHS[int(m) - 1]}, {y}"
+
+
+          def build_caption(m):
+              details = tmdb(f"/movie/{m['id']}", language="en-US")
+              genres = ", ".join(
+                  GENRES_UZ.get(g["id"], g["name"]) for g in details.get("genres", [])[:3]
+              ) or "—"
+              overview = (m.get("overview") or details.get("overview") or "").strip()
+              if len(overview) > 450:
+                  overview = overview[:450].rsplit(" ", 1)[0] + "…"
+              overview = to_uzbek(overview)
+              rating = m.get("vote_average") or 0
+              if m.get("_tag") == "now":
+                  status, date_label = "🎞 Hozir kinoteatrlarda", "Premyera sanasi"
+              else:
+                  status, date_label = "🔜 Tez orada chiqadi", "Chiqish sanasi"
+              lines = [
+                  status,
+                  f"🎬 <b>{html.escape(m['title'])}</b>",
+                  f"📅 {date_label}: {fmt_date(m.get('release_date'))}",
+                  f"🎭 Janr: {html.escape(genres)}",
+              ]
+              if rating:
+                  lines.append(f"⭐ Reyting: {rating:.1f}/10")
+              if overview:
+                  lines += ["", html.escape(overview)]
+              t = trailer_url(m["id"])
+              if t:
+                  lines += ["", f'▶️ <a href="{t}">Treyler</a>']
+              return "\n".join(lines)
+
+
+          def send_photo(m, caption):
+              r = requests.post(
+                  f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
+                  data={
+                      "chat_id": CHAT_ID,
+                      "photo": IMG + m["poster_path"],
+                      "caption": caption[:1024],
+                      "parse_mode": "HTML",
+                  },
+                  timeout=30,
+              )
+              if not r.ok:
+                  print("Telegram xatosi:", r.text, file=sys.stderr)
+                  r.raise_for_status()
+
+
+          def main():
+              sent = load_sent()
+              movies = pick_movies(sent)
+              if not movies:
+                  print("Yangi kino topilmadi.")
+                  return
+              for m in movies:
+                  send_photo(m, build_caption(m))
+                  sent.add(m["id"])
+                  print("Yuborildi:", m["title"])
+              save_sent(sent)
+
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+      - name: Yuborilganlar ro'yxatini saqlash
+        run: |
+          git config user.name "kino-bot"
+          git config user.email "kino-bot@users.noreply.github.com"
+          git add sent.json || true
+          git diff --staged --quiet || (git commit -m "sent.json yangilandi" && git push)
